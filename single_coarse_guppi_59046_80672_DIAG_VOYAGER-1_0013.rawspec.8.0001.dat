@@ -1,0 +1,9 @@
+# -------------------------- o --------------------------
+# File ID: single_coarse_guppi_59046_80672_DIAG_VOYAGER-1_0013.rawspec.8.0001.h5 
+# -------------------------- o --------------------------
+# Source:VOYAGER-1
+# MJD: 59046.933703703704	RA: 17h12m40.482s	DEC: 12d24m13.656s
+# DELTAT:   0.000350	DELTAF(Hz): -366210.937500	max_drift_rate:   4.000000	obs_length: 299.931883
+# --------------------------
+# Top_Hit_# 	Drift_Rate 	SNR 	Uncorrected_Frequency 	Corrected_Frequency 	Index 	freq_start 	freq_end 	SEFD 	SEFD_freq 	Coarse_Channel_Number 	Full_number_of_hits 	
+# --------------------------

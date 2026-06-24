@@ -1,0 +1,14 @@
+
+turbo_seti version 2.3.2
+blimpy version 2.1.4
+h5py version 3.16.0
+hdf5plugin version 6.0.0
+HDF5 library version 2.0.0
+
+
+HDF5 header info: {'DIMENSION_LABELS': array(['time', 'feed_id', 'frequency'], dtype=object), 'az_start': np.float64(0.0), 'data_type': np.int64(1), 'fch1': np.float64(8421.38671875), 'foff': np.float64(-0.3662109375), 'ibeam': np.int64(0), 'machine_id': np.int64(10), 'nbeams': np.int64(0), 'nbits': np.int64(8), 'nchans': np.int64(8), 'nifs': np.int64(1), 'rawdatafile': '', 'source_name': 'VOYAGER-1 OFF', 'src_dej': <Angle 12.40376944 deg>, 'src_raj': <Angle 17.27950361 hourangle>, 'telescope_id': np.int64(6), 'tsamp': np.float64(0.000349525333333333), 'tstart': np.float64(59046.937372685185), 'za_start': np.float64(0.0)}
+
+Starting ET search with parameters: datafile=/datag/public/voyager_2020/single_coarse_channel/single_coarse_guppi_59046_80989_DIAG_VOYAGER-1_0014.rawspec.8.0001.h5, max_drift=4, min_drift=1e-05, snr=10, out_dir=./, coarse_chans=None, flagging=False, n_coarse_chan=1, kernels=None, gpu_id=0, gpu_backend=False, blank_dc=True, precision=1, append_output=False, log_level_int=20, obs_info={'pulsar': 0, 'pulsar_found': 0, 'pulsar_dm': 0.0, 'pulsar_snr': 0.0, 'pulsar_stats': array([0., 0., 0., 0., 0., 0.]), 'RFI_level': 0.0, 'Mean_SEFD': 0.0, 'psrflux_Sens': 0.0, 'SEFDs_val': [0.0], 'SEFDs_freq': [0.0], 'SEFDs_freq_up': [0.0]}
+
+Computed drift rate resolution: 1222.4405415581082
+
