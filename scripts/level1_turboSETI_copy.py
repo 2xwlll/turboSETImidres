@@ -1,8 +1,10 @@
 from blimpy import Waterfall
 from turbo_seti.find_doppler.find_doppler import FindDoppler
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
 import glob
 import os
 import time
@@ -13,46 +15,125 @@ import time
 
 BASE_DIR = "/datag/public/voyager_2020/single_coarse_channel/"
 OUTDIR = "/datax/scratch/wlll2x/results"
+
 os.makedirs(OUTDIR, exist_ok=True)
 
-SNR_THRESHOLD = 10
 MAX_DRIFT = 4
-
-files = sorted(glob.glob(BASE_DIR + "*VOYAGER-1_00*.h5"))
-
-print(f"Found {len(files)} files")
+SNR_THRESHOLD = 10
 
 # --------------------------------------------------
-# STORAGE
+# FIND ONLY VALID SCIENCE FILES
+# --------------------------------------------------
+
+all_files = sorted(glob.glob(os.path.join(BASE_DIR, "*.h5")))
+
+files = []
+
+for f in all_files:
+
+    if ".8.0001." in f:
+        continue
+
+    if ".0002." in f:
+        continue
+
+    if ".0000." not in f:
+        continue
+
+    files.append(f)
+
+print(f"\nFound {len(files)} valid .0000 science files")
+
+# --------------------------------------------------
+# RESULTS STORAGE
 # --------------------------------------------------
 
 results = []
 
 # --------------------------------------------------
-# PROCESS LOOP
+# MAIN LOOP
 # --------------------------------------------------
 
-for i, f in enumerate(files):
+for i, filename in enumerate(files):
 
-    print("\n==============================")
-    print(f"[{i+1}/{len(files)}] {os.path.basename(f)}")
+    print("\n===================================")
+    print(f"[{i+1}/{len(files)}]")
+    print(os.path.basename(filename))
 
     try:
-        # -----------------------------
-        # Load header ONLY (fast)
-        # -----------------------------
-        wf = Waterfall(f, load_data=False)
 
-        fch1 = float(wf.header["fch1"])
-        foff = float(wf.header["foff"])
+        # ------------------------------------------
+        # LOAD DATA
+        # ------------------------------------------
 
-        # -----------------------------
-        # Run TurboSETI
-        # -----------------------------
+        wf = Waterfall(filename, load_data=True)
+
+        header = wf.header
+
+        source_name = str(header["source_name"])
+        fch1 = float(header["fch1"])
+        foff = float(header["foff"])
+
+        print("Source:", source_name)
+
+        if "OFF" in source_name:
+            scan_type = "OFF"
+        else:
+            scan_type = "ON"
+
+        data = wf.data[:, 0, :]
+
+        print("Shape:", data.shape)
+
+        # ------------------------------------------
+        # FULL WATERFALL
+        # ------------------------------------------
+
+        plot_data = np.log10(data + 1)
+
+        vmin = np.percentile(plot_data, 5)
+        vmax = np.percentile(plot_data, 95)
+
+        plt.figure(figsize=(12, 6))
+
+        plt.imshow(
+            plot_data,
+            aspect="auto",
+            origin="lower",
+            vmin=vmin,
+            vmax=vmax
+        )
+
+        plt.xlabel("Frequency Channel")
+        plt.ylabel("Time Integration")
+
+        plt.title(
+            f"{scan_type} : {os.path.basename(filename)}"
+        )
+
+        plt.colorbar(label="log10(power)")
+
+        out_png = os.path.join(
+            OUTDIR,
+            os.path.basename(filename).replace(
+                ".h5",
+                "_waterfall.png"
+            )
+        )
+
+        plt.savefig(out_png, dpi=250, bbox_inches="tight")
+        plt.close()
+
+        # ------------------------------------------
+        # TURBOSETI
+        # ------------------------------------------
+
+        print("Running TurboSETI...")
+
         t0 = time.time()
 
         fd = FindDoppler(
-            f,
+            filename,
             max_drift=MAX_DRIFT,
             snr=SNR_THRESHOLD
         )
@@ -61,96 +142,180 @@ for i, f in enumerate(files):
 
         runtime = time.time() - t0
 
-        # -----------------------------
-        # SAFE RESULT EXTRACTION
-        # -----------------------------
-        # TurboSETI stores results in-memory (this is the key fix)
-        hits = getattr(fd, "hits", None)
+        print(f"Runtime = {runtime:.1f} sec")
 
-        if hits is None or len(hits) == 0:
-            print("No hits")
-            continue
+        # ------------------------------------------
+        # MANUAL PEAK SEARCH
+        # (independent sanity check)
+        # ------------------------------------------
 
-        hits = np.array(hits)
+        mean_spec = np.mean(data, axis=0)
 
-        # Expected format:
-        # [SNR, drift_rate, index, ...]
-        if hits.ndim != 2 or hits.shape[1] < 3:
-            print("Unexpected hit format, skipping")
-            continue
+        peak_index = np.argmax(mean_spec)
 
-        # Pick strongest detection
-        best = hits[np.argmax(hits[:, 0])]
+        peak_power = mean_spec[peak_index]
 
-        snr = float(best[0])
-        drift = float(best[1])
-        index = int(best[2])
+        peak_freq = fch1 + peak_index * foff
 
-        # -----------------------------
-        # Convert index → frequency
-        # -----------------------------
-        freq_mhz = fch1 + index * foff
+        print(
+            f"Peak channel = {peak_index}"
+        )
 
-        print(f"SNR={snr:.2f} | drift={drift:.4f} Hz/s | freq={freq_mhz:.6f} MHz")
+        print(
+            f"Peak frequency = {peak_freq:.6f} MHz"
+        )
 
-        # -----------------------------
-        # STORE RESULT
-        # -----------------------------
+        # ------------------------------------------
+        # ZOOM AROUND PEAK
+        # ------------------------------------------
+
+        window = 5000
+
+        start = max(0, peak_index - window)
+        stop = min(data.shape[1], peak_index + window)
+
+        zoom = data[:, start:stop]
+
+        zoom_log = np.log10(zoom + 1)
+
+        zmin = np.percentile(zoom_log, 5)
+        zmax = np.percentile(zoom_log, 95)
+
+        plt.figure(figsize=(12, 6))
+
+        plt.imshow(
+            zoom_log,
+            aspect="auto",
+            origin="lower",
+            vmin=zmin,
+            vmax=zmax
+        )
+
+        plt.xlabel("Frequency Channel")
+        plt.ylabel("Time Integration")
+
+        plt.title(
+            f"Zoom Around Strongest Signal\n"
+            f"{peak_freq:.6f} MHz"
+        )
+
+        plt.colorbar(label="log10(power)")
+
+        zoom_png = os.path.join(
+            OUTDIR,
+            os.path.basename(filename).replace(
+                ".h5",
+                "_zoom.png"
+            )
+        )
+
+        plt.savefig(
+            zoom_png,
+            dpi=250,
+            bbox_inches="tight"
+        )
+
+        plt.close()
+
+        # ------------------------------------------
+        # SAVE RESULTS
+        # ------------------------------------------
+
         results.append({
-            "file": os.path.basename(f),
-            "snr": snr,
-            "drift": drift,
-            "freq_mhz": freq_mhz,
-            "index": index,
-            "runtime": runtime
+
+            "file":
+                os.path.basename(filename),
+
+            "type":
+                scan_type,
+
+            "peak_freq_mhz":
+                peak_freq,
+
+            "peak_channel":
+                peak_index,
+
+            "peak_power":
+                peak_power,
+
+            "runtime_sec":
+                runtime
+
         })
 
     except Exception as e:
-        print("ERROR:", e)
-        continue
+
+        print("\nERROR:")
+        print(e)
 
 # --------------------------------------------------
-# BUILD DATAFRAME
+# SAVE TABLE
 # --------------------------------------------------
 
 df = pd.DataFrame(results)
 
-print("\n================ RESULTS ================\n")
+csv_file = os.path.join(
+    OUTDIR,
+    "voyager_summary.csv"
+)
+
+df.to_csv(csv_file, index=False)
+
+print("\n===================================")
+print("SUMMARY")
+print("===================================")
+
 print(df)
 
-df.to_csv(os.path.join(OUTDIR, "voyager_clean_results.csv"), index=False)
+print("\nSaved:")
+print(csv_file)
 
 # --------------------------------------------------
-# DIAGNOSTIC PLOTS
+# STABILITY PLOTS
 # --------------------------------------------------
 
 if len(df) > 0:
 
-    # Frequency stability
     plt.figure()
-    plt.plot(df["freq_mhz"], marker="o")
-    plt.title("Frequency vs Scan")
-    plt.xlabel("Scan index")
-    plt.ylabel("MHz")
-    plt.savefig(os.path.join(OUTDIR, "freq_stability.png"))
+
+    plt.plot(
+        df["peak_freq_mhz"],
+        marker="o"
+    )
+
+    plt.title("Peak Frequency Stability")
+
+    plt.xlabel("Scan")
+    plt.ylabel("Frequency (MHz)")
+
+    plt.savefig(
+        os.path.join(
+            OUTDIR,
+            "frequency_stability.png"
+        )
+    )
+
     plt.close()
 
-    # Drift stability
     plt.figure()
-    plt.plot(df["drift"], marker="o")
-    plt.title("Drift vs Scan")
-    plt.xlabel("Scan index")
-    plt.ylabel("Hz/s")
-    plt.savefig(os.path.join(OUTDIR, "drift_stability.png"))
+
+    plt.plot(
+        df["peak_power"],
+        marker="o"
+    )
+
+    plt.title("Peak Power Stability")
+
+    plt.xlabel("Scan")
+    plt.ylabel("Power")
+
+    plt.savefig(
+        os.path.join(
+            OUTDIR,
+            "power_stability.png"
+        )
+    )
+
     plt.close()
 
-    # SNR stability
-    plt.figure()
-    plt.plot(df["snr"], marker="o")
-    plt.title("SNR vs Scan")
-    plt.xlabel("Scan index")
-    plt.ylabel("SNR")
-    plt.savefig(os.path.join(OUTDIR, "snr_stability.png"))
-    plt.close()
-
-print("\nDone. Results saved to:", OUTDIR)
+print("\nDone.")
