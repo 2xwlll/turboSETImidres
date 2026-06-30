@@ -99,6 +99,22 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip rows when the .h5 input file does not exist",
     )
+    parser.add_argument(
+        "--plot-mode",
+        choices=["context", "hits", "both"],
+        default="context",
+        help="Choose whether to create context-only plots, hit-based plots, or both",
+    )
+    parser.add_argument(
+        "--diagnose-headers",
+        action="store_true",
+        help="Print waterfall header diagnostics for the first processed file",
+    )
+    parser.add_argument(
+        "--skip-search",
+        action="store_true",
+        help="Skip FindDoppler and only generate the requested waterfall plots for a quick pilot run",
+    )
     return parser.parse_args()
 
 
@@ -162,18 +178,61 @@ def normalize_mhz(value: float) -> float:
     return value
 
 
+def print_csv_sanity(rows: List[Dict[str, str]]) -> None:
+    frequencies = [row.get("Frequency", "") for row in rows if row.get("Frequency")]
+    if frequencies:
+        counts: Dict[str, int] = {}
+        for value in frequencies:
+            counts[str(value)] = counts.get(str(value), 0) + 1
+        print("CSV frequency values:")
+        for value, count in sorted(counts.items()):
+            print(f"  {value}: {count}")
+    else:
+        print("CSV frequency values: none found")
+
+    if rows:
+        print("Sample HDF5 paths:")
+        for row in rows[:3]:
+            print(f"  {row.get('h5_path', '')}")
+
+
+def inspect_waterfall_header(input_path: Path) -> None:
+    if not input_path.exists():
+        print(f"Skipping header diagnostics for missing path: {input_path}")
+        return
+    try:
+        wf = Waterfall(str(input_path), load_data=False)
+    except Exception as exc:
+        print(f"Could not inspect waterfall header for {input_path}: {exc}")
+        return
+
+    header = getattr(wf, "header", {}) or {}
+    print(f"Header diagnostics for {input_path}")
+    for key in ("fch1", "foff", "nchans", "nchan", "tsamp", "f_start", "f_stop"):
+        if key in header:
+            print(f"  {key}: {header[key]}")
+    print(f"  available keys: {sorted(header.keys())[:20]}")
+
+
 def infer_frequency_axis(header: dict, nchan: int) -> Tuple[np.ndarray, float]:
-    fch1 = safe_float(header.get("fch1") or header.get("FCH1") or header.get("FREQ"))
+    fch1 = safe_float(header.get("fch1") or header.get("FCH1") or header.get("FREQ") or header.get("f_start"))
     foff = safe_float(header.get("foff") or header.get("DELTAF") or header.get("deltaf"))
+    f_start = safe_float(header.get("f_start") or header.get("fstart"))
+    f_stop = safe_float(header.get("f_stop") or header.get("fstop"))
 
     fch1 = normalize_mhz(fch1)
     foff = normalize_mhz(foff)
-    if foff == 0.0:
+    if foff == 0.0 and nchan > 1 and f_start != 0.0 and f_stop != 0.0:
+        foff = (f_stop - f_start) / max(nchan - 1, 1)
+    elif foff == 0.0:
         foff = 1.0
 
-    freqs_mhz = fch1 + np.arange(nchan, dtype=float) * foff
-    resolution_hz = abs(foff) * 1e6
+    if f_start != 0.0 and f_stop != 0.0 and nchan > 1:
+        freqs_mhz = np.linspace(f_start, f_stop, nchan)
+    else:
+        freqs_mhz = fch1 + np.arange(nchan, dtype=float) * foff
 
+    resolution_hz = abs(foff) * 1e6
     return freqs_mhz, resolution_hz
 
 
@@ -267,6 +326,25 @@ def compute_zoom_bounds(hits_df: pd.DataFrame, pad_mhz: float = 0.1) -> Tuple[fl
     return max(0.0, fmin - padding), fmax + padding
 
 
+def plot_context_waterfall(
+    input_path: Path,
+    output_path: Path,
+    label: str,
+) -> Tuple[Optional[List[int]], Optional[float]]:
+    wf = Waterfall(str(input_path), load_data=True)
+    data = wf.data
+    if data.ndim == 3 and data.shape[1] >= 1:
+        data = data[:, 0, :]
+    if data.ndim != 2:
+        raise ValueError(f"Unexpected Waterfall data shape {data.shape}")
+
+    freqs_mhz, resolution_hz = infer_frequency_axis(wf.header, data.shape[1])
+    tsamp = safe_float(wf.header.get("tsamp"), default=1.0)
+    title = f"{label} context waterfall"
+    save_waterfall_plot(data, freqs_mhz, tsamp, output_path, title)
+    return [int(data.shape[0]), int(data.shape[1])], resolution_hz
+
+
 def plot_hits_waterfall(
     input_path: Path,
     hits_df: pd.DataFrame,
@@ -297,6 +375,9 @@ def process_row(
     max_drift: float,
     min_drift: float,
     snr: float,
+    plot_mode: str,
+    diagnose_headers: bool,
+    skip_search: bool,
 ) -> Dict[str, object]:
     target = row.get("Target", "unknown")
     session = row.get("Session", "unknown")
@@ -318,6 +399,8 @@ def process_row(
         "frequency_mhz": frequency,
         "h5_path": str(input_path),
         "waterfall_png": "",
+        "context_waterfall_png": "",
+        "candidate_waterfall_png": "",
         "dat_files": [],
         "resolution_hz": None,
         "shape": None,
@@ -329,33 +412,50 @@ def process_row(
         summary["error"] = f"Input file not found: {input_path}"
         return summary
 
-    try:
-        print(f"Running turboSETI on {input_path} (label={label})")
-        t_search = time.time()
-        fd = FindDoppler(
-            datafile=str(input_path),
-            max_drift=max_drift,
-            min_drift=min_drift,
-            snr=snr,
-            out_dir=str(case_dir),
-        )
-        fd.search()
-        runtime_search = time.time() - t_search
-        summary["runtime_search_sec"] = round(runtime_search, 3)
+    if diagnose_headers:
+        inspect_waterfall_header(input_path)
 
-        dat_files = [str(p) for p in sorted(case_dir.glob("*.dat"))]
+    try:
+        if skip_search:
+            print(f"Skipping turboSETI search for {input_path} (label={label})")
+            dat_files: List[str] = []
+        else:
+            print(f"Running turboSETI on {input_path} (label={label})")
+            t_search = time.time()
+            fd = FindDoppler(
+                datafile=str(input_path),
+                max_drift=max_drift,
+                min_drift=min_drift,
+                snr=snr,
+                out_dir=str(case_dir),
+            )
+            fd.search()
+            runtime_search = time.time() - t_search
+            summary["runtime_search_sec"] = round(runtime_search, 3)
+            dat_files = [str(p) for p in sorted(case_dir.glob("*.dat"))]
         summary["dat_files"] = dat_files
 
-        hits_df = build_candidate_dataset(dat_files)
-        if hits_df.empty:
-            print(f"No candidates found for {label}; skipping waterfall plot.")
-            return summary
+        if plot_mode in {"context", "both"}:
+            context_plot_path = case_dir / f"{stem}_context_waterfall.png"
+            shape, resolution_hz = plot_context_waterfall(input_path, context_plot_path, label)
+            summary["context_waterfall_png"] = str(context_plot_path)
+            summary["waterfall_png"] = str(context_plot_path)
+            summary["shape"] = shape
+            summary["resolution_hz"] = round(resolution_hz, 6) if resolution_hz is not None else None
 
-        plot_path = case_dir / f"{stem}_candidate_waterfall.png"
-        shape, resolution_hz = plot_hits_waterfall(input_path, hits_df, plot_path, label)
-        summary["waterfall_png"] = str(plot_path)
-        summary["shape"] = shape
-        summary["resolution_hz"] = round(resolution_hz, 6) if resolution_hz is not None else None
+        if plot_mode in {"hits", "both"}:
+            hits_df = build_candidate_dataset(dat_files)
+            if hits_df.empty:
+                print(f"No candidates found for {label}; no hit-based waterfall plot generated.")
+                return summary
+
+            plot_path = case_dir / f"{stem}_candidate_waterfall.png"
+            shape, resolution_hz = plot_hits_waterfall(input_path, hits_df, plot_path, label)
+            summary["candidate_waterfall_png"] = str(plot_path)
+            if plot_mode == "hits":
+                summary["waterfall_png"] = str(plot_path)
+            summary["shape"] = shape
+            summary["resolution_hz"] = round(resolution_hz, 6) if resolution_hz is not None else None
     except Exception as exc:
         summary["error"] = str(exc)
 
@@ -371,6 +471,8 @@ def write_summary_csv(summary_path: Path, rows: List[Dict[str, object]]) -> None
         "frequency_mhz",
         "h5_path",
         "waterfall_png",
+        "context_waterfall_png",
+        "candidate_waterfall_png",
         "dat_files",
         "resolution_hz",
         "shape",
@@ -396,6 +498,8 @@ def main() -> None:
     if args.limit is not None:
         subset_rows = subset_rows[: args.limit]
 
+    print_csv_sanity(subset_rows)
+
     output_dir = Path(args.output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -412,6 +516,9 @@ def main() -> None:
             max_drift=args.max_drift,
             min_drift=args.min_drift,
             snr=args.snr,
+            plot_mode=args.plot_mode,
+            diagnose_headers=args.diagnose_headers,
+            skip_search=args.skip_search,
         )
         results.append(result)
 

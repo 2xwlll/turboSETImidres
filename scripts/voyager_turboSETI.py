@@ -46,8 +46,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTDIR, help="Base output directory")
     parser.add_argument("--max-drift", type=float, default=4.0, help="Maximum drift rate in Hz/s")
-    parser.add_argument("--min-drift", type=float, default=0.00001, help="Minimum drift rate in Hz/s")
+    parser.add_argument("--min-drift", type=float, default=0.0, help="Minimum drift rate in Hz/s")
     parser.add_argument("--snr", type=float, default=10.0, help="Minimum SNR threshold")
+    parser.add_argument("--expected-freq", type=float, default=None, help="Expected narrowband center frequency in MHz for midres region analysis")
+    parser.add_argument("--expected-freq-window", type=float, default=0.01, help="Half-width of expected frequency region in MHz for midres analysis")
+    parser.add_argument("--stationary-zscore-threshold", type=float, default=4.0, help="Z-score threshold for identifying persistent narrowband excess in the expected region")
     parser.add_argument("--f-start", type=float, default=None, help="Start frequency (MHz) to trim input data")
     parser.add_argument("--f-stop", type=float, default=None, help="Stop frequency (MHz) to trim input data")
     parser.add_argument("--cluster-k", type=int, default=3, help="Number of morphology clusters")
@@ -86,17 +89,18 @@ def resolve_case_specs(args: argparse.Namespace) -> List[Tuple[str, str]]:
 def discover_inputs(path: str) -> List[str]:
     if os.path.isdir(path):
         matches: List[str] = []
-        for pattern in ("*.h5", "*.fil", "*.fits"):
-            matches.extend(glob.glob(os.path.join(path, pattern)))
 
+        # ONLY mid-res Voyager products
+        matches.extend(glob.glob(os.path.join(path, "*.rawspec.0002.h5")))
+
+        # optional: safety filter (in case nested dirs appear later)
         filtered: List[str] = []
         for fname in matches:
-            name = Path(fname).name
-            if name.endswith(".8.0001.h5") or ".8.0001.h5" in name:
-                print(f"Skipping HTR file: {fname}")
-                continue
-            filtered.append(fname)
+            if "rawspec.0002.h5" in fname:
+                filtered.append(fname)
+
         return sorted(set(filtered))
+
     return [path]
 
 
@@ -119,6 +123,88 @@ def infer_bandwidth(header: dict, data_shape: Sequence[int]) -> float:
         foff = float(header.get("foff", 0.0))
         return abs(foff) * float(data_shape[1])
     return 0.0
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def infer_frequency_axis(header: dict, nchan: int) -> np.ndarray:
+    fch1 = safe_float(header.get("fch1", header.get("FCH1", header.get("f_start", 0.0))))
+    foff = safe_float(header.get("foff", header.get("DELTAF", header.get("deltaf", 0.0))))
+    f_start = safe_float(header.get("f_start", 0.0))
+    f_stop = safe_float(header.get("f_stop", 0.0))
+
+    if foff == 0.0 and nchan > 1 and f_stop != f_start:
+        foff = (f_stop - f_start) / max(nchan - 1, 1)
+    if foff == 0.0:
+        foff = 1.0
+
+    return fch1 + np.arange(nchan, dtype=float) * foff
+
+
+def robust_spectrum_stats(spectrum: np.ndarray) -> Tuple[float, float, np.ndarray]:
+    median = float(np.median(spectrum))
+    mad = float(np.median(np.abs(spectrum - median)))
+    sigma = max(1.4826 * mad, 1e-9)
+    zscore = (spectrum - median) / sigma
+    return median, sigma, zscore
+
+
+def stationary_line_report(
+    freqs_mhz: np.ndarray,
+    spectrum: np.ndarray,
+    expected_freq: Optional[float],
+    window_mhz: float,
+    zscore_threshold: float,
+) -> Dict[str, Any]:
+    median, sigma, zscore = robust_spectrum_stats(spectrum)
+    report = {
+        "spectrum_median_power": median,
+        "spectrum_sigma_power": sigma,
+        "spectrum_max_zscore": float(np.max(zscore)) if zscore.size else 0.0,
+        "spectrum_threshold_excess_bins": int(np.sum(zscore >= zscore_threshold)),
+    }
+    if expected_freq is not None:
+        region_mask = np.abs(freqs_mhz - expected_freq) <= window_mhz
+        region_spectrum = spectrum[region_mask]
+        region_zscore = zscore[region_mask]
+        report.update(
+            {
+                "expected_freq_mhz": expected_freq,
+                "expected_freq_window_mhz": window_mhz,
+                "expected_region_bin_count": int(np.sum(region_mask)),
+                "expected_region_mean_power": float(np.mean(region_spectrum)) if region_spectrum.size else float("nan"),
+                "expected_region_max_zscore": float(np.max(region_zscore)) if region_zscore.size else float("nan"),
+                "expected_region_excess_bins": int(np.sum(region_zscore >= zscore_threshold)),
+                "expected_region_excess_fraction": float(np.mean(region_zscore >= zscore_threshold)) if region_zscore.size else 0.0,
+            }
+        )
+    return report
+
+
+def count_region_candidates(df: pd.DataFrame, expected_freq: Optional[float], window_mhz: float) -> Dict[str, Any]:
+    if df.empty or expected_freq is None:
+        return {
+            "region_candidate_count": 0,
+            "region_candidate_mean_snr": 0.0,
+            "region_candidate_max_snr": 0.0,
+        }
+    mask = np.abs(df["FrequencyCentreMHz"] - expected_freq) <= window_mhz
+    region_df = df[mask]
+    return {
+        "region_candidate_count": int(len(region_df)),
+        "region_candidate_mean_snr": float(region_df["SNR_abs"].mean()) if len(region_df) else 0.0,
+        "region_candidate_max_snr": float(region_df["SNR_abs"].max()) if len(region_df) else 0.0,
+    }
+
+
+def save_average_spectrum(freqs_mhz: np.ndarray, spectrum: np.ndarray, out_path: str) -> None:
+    df = pd.DataFrame({"frequency_mhz": freqs_mhz, "avg_power": spectrum})
+    df.to_csv(out_path, index=False)
 
 
 def source_scan_type(source_name: str) -> str:
@@ -302,11 +388,13 @@ def build_case_summary(
     dat_path: Path,
     voyager_detected: bool,
     clusters: pd.Series,
+    static_metrics: Optional[Dict[str, Any]] = None,
+    region_metrics: Optional[Dict[str, Any]] = None,
     status: str = "OK",
     error: Optional[str] = None,
 ) -> Dict[str, Any]:
     bandwidth_mhz = infer_bandwidth(header, data_shape)
-    return {
+    summary = {
         "label": label,
         "input_file": input_path,
         "scan_type": scan_type,
@@ -326,6 +414,11 @@ def build_case_summary(
         "status": status,
         "error": error,
     }
+    if static_metrics:
+        summary.update(static_metrics)
+    if region_metrics:
+        summary.update(region_metrics)
+    return summary
 
 
 def process_file(
@@ -335,6 +428,9 @@ def process_file(
     max_drift: float,
     min_drift: float,
     snr: float,
+    expected_freq: Optional[float],
+    expected_freq_window: float,
+    stationary_zscore_threshold: float,
     f_start: Optional[float],
     f_stop: Optional[float],
     cluster_k: int,
@@ -361,6 +457,18 @@ def process_file(
         header = wf.header
         source_name = str(header.get("source_name", "unknown"))
         scan_type = source_scan_type(source_name)
+
+        freqs_mhz = infer_frequency_axis(header, data.shape[1])
+        avg_spectrum = np.mean(data, axis=0)
+        static_metrics = stationary_line_report(
+            freqs_mhz,
+            avg_spectrum,
+            expected_freq=expected_freq,
+            window_mhz=expected_freq_window,
+            zscore_threshold=stationary_zscore_threshold,
+        )
+        if expected_freq is not None:
+            save_average_spectrum(freqs_mhz, avg_spectrum, str(case_dir / f"{stem}_avg_spectrum.csv"))
 
         waterfall_path = case_dir / f"{stem}_waterfall.png"
         save_waterfall_plot(data, str(waterfall_path), f"{label}: {Path(input_path).name}")
@@ -389,6 +497,7 @@ def process_file(
         else:
             morphology_labels = pd.Series(dtype=int)
 
+        region_metrics = count_region_candidates(hits_df, expected_freq, expected_freq_window)
         summary = build_case_summary(
             input_path=input_path,
             label=label,
@@ -402,6 +511,8 @@ def process_file(
             dat_path=dat_path,
             voyager_detected=detect_voyager_hit(input_path, source_name, len(hits_df)),
             clusters=morphology_labels,
+            static_metrics=static_metrics,
+            region_metrics=region_metrics,
         )
         with open(case_dir / f"{stem}_summary.json", "w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2)
@@ -481,6 +592,9 @@ def main() -> None:
                 max_drift=args.max_drift,
                 min_drift=args.min_drift,
                 snr=args.snr,
+                expected_freq=args.expected_freq,
+                expected_freq_window=args.expected_freq_window,
+                stationary_zscore_threshold=args.stationary_zscore_threshold,
                 f_start=args.f_start,
                 f_stop=args.f_stop,
                 cluster_k=args.cluster_k,
