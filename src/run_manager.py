@@ -2,7 +2,7 @@
 
 from src.config import Config
 from src.data_io import load_data
-from src.search import run_search
+from search_carmen_frequencies import run_search
 from src.candidates import postprocess_candidates
 from src.utils import setup_logger
 
