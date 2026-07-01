@@ -16,6 +16,7 @@ import argparse
 import csv
 import glob
 import json
+import math
 import os
 import time
 import warnings
@@ -31,6 +32,7 @@ from turbo_seti.find_event.find_event import find_events, read_dat
 
 
 DEFAULT_OUTDIR = "/datax/scratch/wlll2x/results"
+CANDIDATE_WATERFALL_WINDOW_MHZ = 5.0
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,15 +47,25 @@ def parse_args() -> argparse.Namespace:
         help="Case specification as label=/path/to/file-or-directory. Repeat for each case.",
     )
     parser.add_argument("--output-dir", default=DEFAULT_OUTDIR, help="Base output directory")
-    parser.add_argument("--max-drift", type=float, default=4.0, help="Maximum drift rate in Hz/s")
-    parser.add_argument("--min-drift", type=float, default=0.0, help="Minimum drift rate in Hz/s")
+    parser.add_argument("--max-drift", type=float, default=6.0, help="Maximum drift rate in Hz/s")
+    parser.add_argument("--min-drift", type=float, default=-6.0, help="Minimum drift rate in Hz/s")
     parser.add_argument("--snr", type=float, default=10.0, help="Minimum SNR threshold")
-    parser.add_argument("--expected-freq", type=float, default=None, help="Expected narrowband center frequency in MHz for midres region analysis")
-    parser.add_argument("--expected-freq-window", type=float, default=0.01, help="Half-width of expected frequency region in MHz for midres analysis")
-    parser.add_argument("--stationary-zscore-threshold", type=float, default=4.0, help="Z-score threshold for identifying persistent narrowband excess in the expected region")
     parser.add_argument("--f-start", type=float, default=None, help="Start frequency (MHz) to trim input data")
     parser.add_argument("--f-stop", type=float, default=None, help="Stop frequency (MHz) to trim input data")
     parser.add_argument("--cluster-k", type=int, default=3, help="Number of morphology clusters")
+    parser.add_argument("--top-candidates", type=int, default=10, help="Save top N SNR candidate peaks per file")
+    parser.add_argument(
+        "--nfpc",
+        type=int,
+        default=None,
+        help="Override nfpc in the H5 header by deriving n_coarse_chan from the total number of channels.",
+    )
+    parser.add_argument(
+        "--n-coarse-chan",
+        type=int,
+        default=None,
+        help="Override the number of coarse channels used by turboSETI.",
+    )
     parser.add_argument(
         "--on-off-first",
         choices=("ON", "OFF"),
@@ -146,6 +158,31 @@ def infer_frequency_axis(header: dict, nchan: int) -> np.ndarray:
     return fch1 + np.arange(nchan, dtype=float) * foff
 
 
+def infer_n_coarse_chan_from_nfpc(header: dict, nfpc: int, nchan: int) -> Optional[int]:
+    if nfpc is None:
+        return None
+    if nfpc <= 0:
+        raise ValueError("nfpc must be a positive integer")
+
+    total_nchans = None
+    if header.get("nchans") is not None:
+        try:
+            total_nchans = int(header["nchans"])
+        except (TypeError, ValueError):
+            total_nchans = None
+    if total_nchans is None:
+        total_nchans = nchan
+
+    if total_nchans <= 0:
+        raise ValueError("Could not determine total number of channels from the header or data")
+
+    n_coarse_chan = int(round(total_nchans / nfpc))
+    if n_coarse_chan <= 0:
+        raise ValueError("Derived n_coarse_chan must be positive")
+
+    return n_coarse_chan
+
+
 def robust_spectrum_stats(spectrum: np.ndarray) -> Tuple[float, float, np.ndarray]:
     median = float(np.median(spectrum))
     mad = float(np.median(np.abs(spectrum - median)))
@@ -154,57 +191,215 @@ def robust_spectrum_stats(spectrum: np.ndarray) -> Tuple[float, float, np.ndarra
     return median, sigma, zscore
 
 
-def stationary_line_report(
-    freqs_mhz: np.ndarray,
-    spectrum: np.ndarray,
-    expected_freq: Optional[float],
-    window_mhz: float,
-    zscore_threshold: float,
-) -> Dict[str, Any]:
-    median, sigma, zscore = robust_spectrum_stats(spectrum)
-    report = {
-        "spectrum_median_power": median,
-        "spectrum_sigma_power": sigma,
-        "spectrum_max_zscore": float(np.max(zscore)) if zscore.size else 0.0,
-        "spectrum_threshold_excess_bins": int(np.sum(zscore >= zscore_threshold)),
-    }
-    if expected_freq is not None:
-        region_mask = np.abs(freqs_mhz - expected_freq) <= window_mhz
-        region_spectrum = spectrum[region_mask]
-        region_zscore = zscore[region_mask]
-        report.update(
-            {
-                "expected_freq_mhz": expected_freq,
-                "expected_freq_window_mhz": window_mhz,
-                "expected_region_bin_count": int(np.sum(region_mask)),
-                "expected_region_mean_power": float(np.mean(region_spectrum)) if region_spectrum.size else float("nan"),
-                "expected_region_max_zscore": float(np.max(region_zscore)) if region_zscore.size else float("nan"),
-                "expected_region_excess_bins": int(np.sum(region_zscore >= zscore_threshold)),
-                "expected_region_excess_fraction": float(np.mean(region_zscore >= zscore_threshold)) if region_zscore.size else 0.0,
-            }
-        )
-    return report
-
-
-def count_region_candidates(df: pd.DataFrame, expected_freq: Optional[float], window_mhz: float) -> Dict[str, Any]:
-    if df.empty or expected_freq is None:
-        return {
-            "region_candidate_count": 0,
-            "region_candidate_mean_snr": 0.0,
-            "region_candidate_max_snr": 0.0,
-        }
-    mask = np.abs(df["FrequencyCentreMHz"] - expected_freq) <= window_mhz
-    region_df = df[mask]
-    return {
-        "region_candidate_count": int(len(region_df)),
-        "region_candidate_mean_snr": float(region_df["SNR_abs"].mean()) if len(region_df) else 0.0,
-        "region_candidate_max_snr": float(region_df["SNR_abs"].max()) if len(region_df) else 0.0,
-    }
 
 
 def save_average_spectrum(freqs_mhz: np.ndarray, spectrum: np.ndarray, out_path: str) -> None:
     df = pd.DataFrame({"frequency_mhz": freqs_mhz, "avg_power": spectrum})
     df.to_csv(out_path, index=False)
+
+
+def infer_on_off_from_index(i: int, on_off_first: str = "ON") -> str:
+    if on_off_first.upper() == "ON":
+        return "ON" if i % 2 == 1 else "OFF"
+    return "OFF" if i % 2 == 1 else "ON"
+
+
+def assign_on_off_labels(paths: List[str], on_off_first: str = "ON") -> List[str]:
+    return [infer_on_off_from_index(i + 1, on_off_first) for i in range(len(paths))]
+
+
+def slice_frequency_region(
+    data: np.ndarray,
+    freqs_mhz: np.ndarray,
+    center_freq_mhz: Optional[float],
+    window_mhz: Optional[float],
+) -> Tuple[np.ndarray, np.ndarray]:
+    if center_freq_mhz is None or window_mhz is None or window_mhz <= 0:
+        return data, freqs_mhz
+
+    if freqs_mhz[0] > freqs_mhz[-1]:
+        data = data[:, ::-1]
+        freqs_mhz = freqs_mhz[::-1]
+
+    mask = np.abs(freqs_mhz - center_freq_mhz) <= window_mhz
+    if not np.any(mask):
+        idx = int(np.argmin(np.abs(freqs_mhz - center_freq_mhz)))
+        channel_width = np.median(np.abs(np.diff(freqs_mhz))) if len(freqs_mhz) > 1 else 0.0
+        half_span = int(max(1, round(window_mhz / max(channel_width, 1e-9))))
+        start = max(0, idx - half_span)
+        stop = min(len(freqs_mhz), idx + half_span + 1)
+        mask = np.zeros(len(freqs_mhz), dtype=bool)
+        mask[start:stop] = True
+
+    return data[:, mask], freqs_mhz[mask]
+
+
+def plot_diff_waterfall(
+    on_data: np.ndarray,
+    off_data: np.ndarray,
+    freqs_mhz: np.ndarray,
+    tsamp: float,
+    out_path: str,
+    title: str,
+    center_freq_mhz: Optional[float] = None,
+    window_mhz: Optional[float] = None,
+) -> None:
+    on_data, cropped_freqs = slice_frequency_region(on_data, freqs_mhz, center_freq_mhz, window_mhz)
+    off_data, _ = slice_frequency_region(off_data, freqs_mhz, center_freq_mhz, window_mhz)
+
+    diff_data = on_data - off_data
+    if diff_data.size == 0:
+        raise ValueError("ON/OFF diff data is empty")
+
+    vmax = float(np.nanpercentile(np.abs(diff_data), 95))
+    if vmax == 0.0:
+        vmax = 1.0
+
+    duration_s = diff_data.shape[0] * tsamp
+    extent = (float(cropped_freqs[0]), float(cropped_freqs[-1]), 0.0, float(duration_s))
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    im = ax.imshow(
+        diff_data,
+        aspect="auto",
+        origin="lower",
+        extent=extent,
+        cmap="seismic",
+        vmin=-vmax,
+        vmax=vmax,
+        interpolation="nearest",
+    )
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("ON - OFF power")
+    ax.set_xlabel("Frequency [MHz]")
+    ax.set_ylabel("Time [s]")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
+
+
+def plot_on_off_summary(
+    label: str,
+    on_paths: List[str],
+    off_paths: List[str],
+    output_dir: Path,
+    f_start: Optional[float] = None,
+    f_stop: Optional[float] = None,
+) -> None:
+    case_dir = output_dir / label
+    for pair_index, (on_path, off_path) in enumerate(zip(on_paths, off_paths), start=1):
+        on_wf = Waterfall(on_path, load_data=True, f_start=f_start, f_stop=f_stop)
+        off_wf = Waterfall(off_path, load_data=True, f_start=f_start, f_stop=f_stop)
+        on_data = on_wf.data[:, 0, :]
+        off_data = off_wf.data[:, 0, :]
+        freqs_mhz = infer_frequency_axis(on_wf.header, on_data.shape[1])
+        tsamp = safe_float(on_wf.header.get("tsamp"), 1.0)
+
+        out_path = case_dir / f"{label}_onoff_pair_{pair_index:02d}_diff.png"
+        plot_diff_waterfall(
+            on_data,
+            off_data,
+            freqs_mhz,
+            tsamp,
+            str(out_path),
+            f"{label} ON-OFF diff pair {pair_index}",
+        )
+
+    if len(on_paths) != len(off_paths):
+        diff_note = f"WARNING: ON/OFF count mismatch: {len(on_paths)} ON, {len(off_paths)} OFF"
+        print(diff_note)
+
+
+def save_top_candidates(df: pd.DataFrame, out_path: str, top_n: int) -> None:
+    if df.empty:
+        pd.DataFrame().to_csv(out_path, index=False)
+        return
+    df.sort_values("SNR_abs", ascending=False).head(top_n).to_csv(out_path, index=False)
+
+
+def rebin_2d(data: np.ndarray, max_points: int) -> np.ndarray:
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D waterfall data, got shape {data.shape}")
+
+    n_time, n_freq = data.shape
+    time_factor = max(1, math.ceil(n_time / max_points))
+    freq_factor = max(1, math.ceil(n_freq / max_points))
+
+    if time_factor == 1 and freq_factor == 1:
+        return data
+
+    trimmed_time = (n_time // time_factor) * time_factor
+    trimmed_freq = (n_freq // freq_factor) * freq_factor
+    data = data[:trimmed_time, :trimmed_freq]
+    data = data.reshape(trimmed_time // time_factor, time_factor, trimmed_freq // freq_factor, freq_factor)
+    return data.mean(axis=(1, 3))
+
+
+def save_waterfall_plot(
+    data: np.ndarray,
+    freqs_mhz: np.ndarray,
+    tsamp: float,
+    out_path: str,
+    title: str,
+    center_freq_mhz: Optional[float] = None,
+    window_mhz: Optional[float] = None,
+) -> None:
+    if data.ndim == 3:
+        data = data[:, 0, :]
+
+    if data.ndim != 2:
+        raise ValueError(f"Expected 2D waterfall data, got shape {data.shape}")
+
+    data = np.asarray(data, dtype=float)
+    if data.size == 0:
+        raise ValueError("Waterfall data is empty")
+
+    if freqs_mhz[0] > freqs_mhz[-1]:
+        data = data[:, ::-1]
+        freqs_mhz = freqs_mhz[::-1]
+
+    if center_freq_mhz is not None and window_mhz is not None and window_mhz > 0:
+        mask = np.abs(freqs_mhz - center_freq_mhz) <= window_mhz
+        if not np.any(mask):
+            idx = int(np.argmin(np.abs(freqs_mhz - center_freq_mhz)))
+            channel_width = np.median(np.abs(np.diff(freqs_mhz))) if len(freqs_mhz) > 1 else 0.0
+            half_span = int(max(1, round(window_mhz / max(channel_width, 1e-9))))
+            start = max(0, idx - half_span)
+            stop = min(len(freqs_mhz), idx + half_span + 1)
+            mask = np.zeros(len(freqs_mhz), dtype=bool)
+            mask[start:stop] = True
+        data = data[:, mask]
+        freqs_mhz = freqs_mhz[mask]
+
+    original_time, original_freq = data.shape
+    data = data.clip(min=0.0) + 1.0
+    data_db = 10.0 * np.log10(data)
+
+    if original_time > 2200 or original_freq > 2200:
+        data_db = rebin_2d(data_db, 2200)
+        freqs_mhz = np.linspace(float(freqs_mhz[0]), float(freqs_mhz[-1]), data_db.shape[1])
+
+    duration_s = original_time * tsamp
+    extent = (float(freqs_mhz[0]), float(freqs_mhz[-1]), 0.0, float(duration_s))
+
+    fig, ax = plt.subplots(figsize=(14, 6))
+    im = ax.imshow(
+        data_db,
+        aspect="auto",
+        origin="lower",
+        extent=extent,
+        cmap="viridis",
+        interpolation="nearest",
+    )
+    cbar = fig.colorbar(im, ax=ax)
+    cbar.set_label("Power [dB]")
+    ax.set_xlabel("Frequency [MHz]")
+    ax.set_ylabel("Time [s]")
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=250, bbox_inches="tight")
+    plt.close(fig)
 
 
 def source_scan_type(source_name: str) -> str:
@@ -214,36 +409,6 @@ def source_scan_type(source_name: str) -> str:
     if "on" in source_lower:
         return "ON"
     return "ON"
-
-
-def save_waterfall_plot(data: np.ndarray, out_path: str, title: str) -> None:
-    if data.ndim != 2:
-        data = np.asarray(data).reshape(-1, 1)
-
-    plot_data = np.log10(np.asarray(data, dtype=float) + 1)
-    if plot_data.size == 0:
-        return
-
-    mean_spec = np.mean(plot_data, axis=0)
-    peak_idx = int(np.argmax(mean_spec))
-    nchan = plot_data.shape[1]
-    window = max(200, min(5000, int(0.01 * nchan)))
-    left = max(0, peak_idx - window // 2)
-    right = min(nchan, left + window)
-    left = max(0, right - window)
-    zoom_data = plot_data[:, left:right]
-
-    vmin = np.percentile(zoom_data, 5)
-    vmax = np.percentile(zoom_data, 95)
-
-    plt.figure(figsize=(12, 6))
-    plt.imshow(zoom_data, aspect="auto", origin="lower", vmin=vmin, vmax=vmax)
-    plt.xlabel("Frequency Channel")
-    plt.ylabel("Time Integration")
-    plt.title(f"{title} (zoomed around strongest spectral feature)")
-    plt.colorbar(label="log10(power)")
-    plt.savefig(out_path, dpi=250, bbox_inches="tight")
-    plt.close()
 
 
 def safe_read_dat(dat_path: Path) -> pd.DataFrame:
@@ -428,13 +593,14 @@ def process_file(
     max_drift: float,
     min_drift: float,
     snr: float,
-    expected_freq: Optional[float],
-    expected_freq_window: float,
-    stationary_zscore_threshold: float,
     f_start: Optional[float],
     f_stop: Optional[float],
     cluster_k: int,
     anomaly_percentile: float,
+    top_candidates: int,
+    scan_type_override: Optional[str] = None,
+    nfpc: Optional[int] = None,
+    n_coarse_chan_override: Optional[int] = None,
 ) -> dict:
     case_dir = output_dir / label
     case_dir.mkdir(parents=True, exist_ok=True)
@@ -456,31 +622,40 @@ def process_file(
         data = wf.data[:, 0, :]
         header = wf.header
         source_name = str(header.get("source_name", "unknown"))
-        scan_type = source_scan_type(source_name)
+        scan_type = scan_type_override if scan_type_override is not None else source_scan_type(source_name)
 
         freqs_mhz = infer_frequency_axis(header, data.shape[1])
+        tsamp = safe_float(header.get("tsamp"), 1.0)
         avg_spectrum = np.mean(data, axis=0)
-        static_metrics = stationary_line_report(
-            freqs_mhz,
-            avg_spectrum,
-            expected_freq=expected_freq,
-            window_mhz=expected_freq_window,
-            zscore_threshold=stationary_zscore_threshold,
-        )
-        if expected_freq is not None:
-            save_average_spectrum(freqs_mhz, avg_spectrum, str(case_dir / f"{stem}_avg_spectrum.csv"))
 
         waterfall_path = case_dir / f"{stem}_waterfall.png"
-        save_waterfall_plot(data, str(waterfall_path), f"{label}: {Path(input_path).name}")
+        save_waterfall_plot(
+            data,
+            freqs_mhz,
+            tsamp,
+            str(waterfall_path),
+            f"{label}: {Path(input_path).name}",
+        )
 
         print("Running turboSETI...")
         t_search = time.time()
+
+        if n_coarse_chan_override is not None:
+            effective_n_coarse_chan = n_coarse_chan_override
+            print(f"Using explicit n_coarse_chan override: {effective_n_coarse_chan}")
+        elif nfpc is not None:
+            effective_n_coarse_chan = infer_n_coarse_chan_from_nfpc(header, nfpc, data.shape[1])
+            print(f"Using nfpc override {nfpc} -> n_coarse_chan={effective_n_coarse_chan}")
+        else:
+            effective_n_coarse_chan = None
+
         fd = FindDoppler(
             input_path,
             max_drift=max_drift,
             min_drift=min_drift,
             snr=snr,
             out_dir=str(case_dir),
+            n_coarse_chan=effective_n_coarse_chan,
         )
         fd.search()
         runtime_search = time.time() - t_search
@@ -494,10 +669,24 @@ def process_file(
             hits_df.to_csv(case_dir / f"{stem}_candidate_features.csv", index=False)
             anomalies_df = find_anomalies(hits_df, anomaly_percentile)
             anomalies_df.to_csv(case_dir / f"{stem}_anomalies.csv", index=False)
+            save_top_candidates(hits_df, str(case_dir / f"{stem}_top_candidates.csv"), top_candidates)
+
+            top_candidate = hits_df.sort_values("SNR_abs", ascending=False).iloc[0]
+            candidate_freq = float(top_candidate["FrequencyCentreMHz"])
+            candidate_waterfall_path = case_dir / f"{stem}_candidate_waterfall.png"
+            save_waterfall_plot(
+                data,
+                freqs_mhz,
+                tsamp,
+                str(candidate_waterfall_path),
+                f"{label}: top candidate {candidate_freq:.6f} MHz",
+                center_freq_mhz=candidate_freq,
+                window_mhz=CANDIDATE_WATERFALL_WINDOW_MHZ,
+            )
         else:
             morphology_labels = pd.Series(dtype=int)
+            save_top_candidates(hits_df, str(case_dir / f"{stem}_top_candidates.csv"), top_candidates)
 
-        region_metrics = count_region_candidates(hits_df, expected_freq, expected_freq_window)
         summary = build_case_summary(
             input_path=input_path,
             label=label,
@@ -511,8 +700,6 @@ def process_file(
             dat_path=dat_path,
             voyager_detected=detect_voyager_hit(input_path, source_name, len(hits_df)),
             clusters=morphology_labels,
-            static_metrics=static_metrics,
-            region_metrics=region_metrics,
         )
         with open(case_dir / f"{stem}_summary.json", "w", encoding="utf-8") as fh:
             json.dump(summary, fh, indent=2)
@@ -584,7 +771,11 @@ def main() -> None:
             continue
 
         print(f"\nRunning case '{label}' with {len(inputs)} input file(s)")
-        for input_path in inputs:
+        scan_types = assign_on_off_labels(inputs, args.on_off_first)
+        on_paths: List[str] = []
+        off_paths: List[str] = []
+
+        for index, input_path in enumerate(inputs):
             result = process_file(
                 input_path=input_path,
                 label=label,
@@ -592,17 +783,35 @@ def main() -> None:
                 max_drift=args.max_drift,
                 min_drift=args.min_drift,
                 snr=args.snr,
-                expected_freq=args.expected_freq,
-                expected_freq_window=args.expected_freq_window,
-                stationary_zscore_threshold=args.stationary_zscore_threshold,
                 f_start=args.f_start,
                 f_stop=args.f_stop,
                 cluster_k=args.cluster_k,
                 anomaly_percentile=args.anomaly_percentile,
+                top_candidates=args.top_candidates,
+                scan_type_override=scan_types[index],
+                nfpc=args.nfpc,
+                n_coarse_chan_override=args.n_coarse_chan,
             )
             summaries.append(result)
             if result.get("dat_file"):
                 dat_paths.append(result["dat_file"])
+            if scan_types[index] == "ON":
+                on_paths.append(input_path)
+            else:
+                off_paths.append(input_path)
+
+        if on_paths and off_paths:
+            try:
+                plot_on_off_summary(
+                    label,
+                    on_paths,
+                    off_paths,
+                    output_dir,
+                    f_start=args.f_start,
+                    f_stop=args.f_stop,
+                )
+            except Exception as exc:
+                print(f"Failed to generate ON/OFF summary for {label}: {exc}")
 
     save_overall_summary(summaries, output_dir)
 
