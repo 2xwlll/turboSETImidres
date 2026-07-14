@@ -1,11 +1,16 @@
 {
-	"folders": [
-		{
-			"path": "."
-		},
-		{
-			"path": "../../../datax/scratch/wlll2x"
-		}
-	],
-	"settings": {}
+    "folders": [
+        {
+            "path": "."
+        },
+        {
+            "path": "../../../datax/scratch/wlll2x"
+        },
+        {
+            "path": "../oscar"
+        }
+    ],
+    "settings": {
+        "python.defaultInterpreterPath": "/home/wlll2x/.conda/envs/willvenv/bin/python"
+    }
 }
