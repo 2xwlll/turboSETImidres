@@ -1,0 +1,3 @@
+http://blpd0.ssl.berkeley.edu/blc2/dibas.20160109/AGBT16A_999_17/GUPPI/C/blc2_2bit_guppi_57396_VOYAGER1_0002.0000.raw
+http://blpd0.ssl.berkeley.edu/blc2/dibas.20160109/AGBT16A_999_17/GUPPI/C/blc2_2bit_guppi_57396_VOYAGER1_0003.0000.raw
+http://blpd0.ssl.berkeley.edu/blc5/dibas.20160109/AGBT16A_999_17/GUPPI/F/blc5_2bit_guppi_57396_VOYAGER1_OFF_0003.0000.raw

@@ -1,9 +1,0 @@
-# -------------------------- o --------------------------
-# File ID: spliced_blc00010203040506o7o0111213141516o7o021222324252627_guppi_59046_80036_DIAG_VOYAGER-1_0011.rawspec.0002.h5 
-# -------------------------- o --------------------------
-# Source:VOYAGER-1
-# MJD: 59046.926342592589	RA: 17h12m40.481s	DEC: 12d24m13.614s
-# DELTAT:   1.073742	DELTAF(Hz): -2861.022949	max_drift_rate:   4.000000	obs_length: 299.573969
-# --------------------------
-# Top_Hit_# 	Drift_Rate 	SNR 	Uncorrected_Frequency 	Corrected_Frequency 	Index 	freq_start 	freq_end 	SEFD 	SEFD_freq 	Coarse_Channel_Number 	Full_number_of_hits 	
-# --------------------------

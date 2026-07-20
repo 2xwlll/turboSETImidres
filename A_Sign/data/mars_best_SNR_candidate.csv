@@ -1,0 +1,2 @@
+Unnamed: 0,TopHitNum,DriftRate,SNR,Freq,ChanIndx,FreqStart,FreqEnd,CoarseChanNum,FullNumHitsInRange,FileID,Source,MJD,RA,DEC,DELTAT,DELTAF,max_drift_rate,obs_length,Hit_ID,status,in_n_ons,RFI_in_range,delta_t
+48276,9188,4.918451,43.174603,8414.488818,371960,8414.4881,8414.489536,0,3,,DIAG_MARS2020,59256.78146990741,00h00m00.000ss,+00d00m00.00s,18.253611,-2.793968,0,292.057776,,on_table_3,,,1254.0000001899898
